@@ -23,10 +23,10 @@ intltool-dev
 libedit
 libedit-dev
 libffi-dev
-#libffi-staticdev
+libffi-staticdev
 libstdc++-dev
 libxml2-dev
-#libxml2-staticdev
+libxml2-staticdev
 llvm
 llvm-bin
 llvm-data
