@@ -170,6 +170,10 @@ export SSL_CERT_FILE=/var/cache/ca-certs/anchors/ca-certificates.crt
 export CARGO_HTTP_CAINFO=/var/cache/ca-certs/anchors/ca-certificates.crt
 export CARGO_TARGET_DIR=target
 cargo install %{?_smp_mflags} --all-features --offline --no-track --target x86_64-unknown-linux-gnu --verbose --path . --target-dir target --root %{buildroot}/usr/
+## install_append content
+install -dm 0755 %{buildroot}/usr/share/delta
+install -m0644 /builddir/build/BUILD/delta/themes.gitconfig %{buildroot}/usr/share/delta/themes.gitconfig
+## install_append end
 ## Cargo install assets
 install -dm 0755 %{buildroot}/usr/share/bash-completion/completions/
 install -m0644 /builddir/build/BUILD/delta/etc/completion/completion.bash %{buildroot}/usr/share/bash-completion/completions/delta
@@ -186,4 +190,5 @@ install -m0644 /builddir/build/BUILD/delta/etc/completion/completion.zsh %{build
 %files data
 %defattr(-,root,root,-)
 /usr/share/bash-completion/completions/delta
+/usr/share/delta/themes.gitconfig
 /usr/share/zsh/site-functions/_delta

@@ -1,0 +1,2 @@
+install -dm 0755 %{buildroot}/usr/share/delta
+install -m0644 /builddir/build/BUILD/delta/themes.gitconfig %{buildroot}/usr/share/delta/themes.gitconfig
