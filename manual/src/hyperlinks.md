@@ -23,6 +23,42 @@ For VSCode and JetBrains IDEs this is easy, since they support their own special
 
 Zed also supports its own URL protocol, and probably others.
 
+## Linking to a match column
+
+For `rg --json` output, add `{column}` to your file-link format to link to the
+first match on a line. For a handler that accepts `file://path:line:column`, use:
+
+```gitconfig
+[delta]
+    hyperlinks = true
+    hyperlinks-file-link-format = "file://{path}:{line}:{column}"
+```
+
+If you already use an editor-specific URL scheme, keep that scheme and add
+`{column}` in the position or query parameter expected by its handler. Delta
+constructs the link; your terminal's URL handler opens the editor at that location.
+
+For example, if `world` occurs on line 6 of `test_file.rs` with `"start":24`,
+the line-number hyperlink ends in `test_file.rs:6:25`. The visible line number
+and syntax highlighting stay the same. This works with both the default ripgrep
+layout and `--grep-output-type=classic`.
+
+The column is a **one-based byte position**, not a Unicode character count or a
+terminal display column. Delta uses the first submatch's zero-based `start`
+offset plus one, before expanding tabs; changing `--tabs` does not change the
+destination. When a line contains several matches, its link targets the first.
+Ripgrep's `--column` option is not required when using `--json`.
+
+When no match column is available, `{column}` expands to `1`. This includes file
+headings, context lines, match records with no submatches (such as inverted
+searches), ordinary grep output, and diffs. With the format above, a ripgrep file
+heading links to `test_file.rs:0:1`; its existing line number of `0` is unchanged.
+
+Column-aware links are opt-in: the default remains `file://{path}`, and existing
+formats without `{column}` keep their current destinations.
+
+## Other ways to open links in an editor
+
 If your editor does not have its own URL protocol, then there are still many possibilities, although they may be more work.
 
 - The easiest is probably to write a toy HTTP server (e.g. in [Python](https://docs.python.org/3/library/http.server.html)) that opens the links in the way that you need. Then your delta config would look something like
@@ -68,4 +104,7 @@ If your editor does not have its own URL protocol, then there are still many pos
     hyperlinks-file-link-format = "my-file-line-protocol://{path}:{line}"
     # Now configure your OS to handle "my-file-line-protocol" URLs!
     ```
-- Finally, you can just use traditional `file://` links (making sure your OS is configured to use the correct editor). But then your editor won't open the file at the correct line, which would be missing out on something very useful.
+- If opening the file is sufficient, keep the default `file://{path}` format and
+  configure your OS to open those links in your editor. That format carries no
+  line or column position; requesting a location requires one of the
+  location-aware formats and handlers described above.

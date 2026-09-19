@@ -14,6 +14,16 @@ pub fn parse_line(line: &str) -> Option<grep::GrepLine<'_>> {
         Some(ripgrep_line) => {
             // A real line of rg --json output, i.e. either of type "match" or
             // "context".
+            // Ripgrep orders submatches by their zero-based byte offsets into `lines`.
+            // Save the first match's one-based source column before tab expansion
+            // shifts the submatch offsets used for highlighting.
+            let column_number = if ripgrep_line._type == grep::LineType::Match {
+                ripgrep_line.data.submatches.first().map(|m| m.start + 1)
+            } else {
+                // Inverted searches can put submatches in context records, but
+                // those are not search hits. Context links still target column 1.
+                None
+            };
             let mut code = ripgrep_line.data.lines.text;
             // Keep newlines so the syntax highlighter handles C-style line comments
             // correctly. Also remove \r, see [EndCRLF] in src/delta.rs, but this time
@@ -26,6 +36,7 @@ pub fn parse_line(line: &str) -> Option<grep::GrepLine<'_>> {
                 grep_type: crate::config::GrepType::Ripgrep,
                 line_type: ripgrep_line._type,
                 line_number: ripgrep_line.data.line_number,
+                column_number,
                 path: Cow::from(ripgrep_line.data.path.text),
                 code: Cow::from(code),
                 submatches: Some(
@@ -49,6 +60,7 @@ pub fn parse_line(line: &str) -> Option<grep::GrepLine<'_>> {
                         grep_type: crate::config::GrepType::Ripgrep,
                         line_type: grep::LineType::Ignore,
                         line_number: None,
+                        column_number: None,
                         path: "".into(),
                         code: "".into(),
                         submatches: None,
@@ -122,6 +134,154 @@ mod tests {
 
     use crate::tests::integration_test_utils::DeltaTest;
     use insta::assert_snapshot;
+    use rstest::rstest;
+
+    fn hyperlink_test(output_type: &str, link_format: &str) -> DeltaTest<'static> {
+        let cwd = crate::utils::path::fake_delta_cwd_for_tests();
+        DeltaTest::with_args(&[
+            "--hyperlinks",
+            "--hyperlinks-file-link-format",
+            link_format,
+            "--grep-output-type",
+            output_type,
+        ])
+        .set_config(|config| {
+            config.cwd_of_delta_process = Some(cwd.clone());
+            config.cwd_of_user_shell_process = Some(cwd.clone());
+        })
+    }
+
+    fn match_record(
+        line_type: &str,
+        code: &str,
+        line_number: Option<usize>,
+        submatches: &[(usize, usize)],
+    ) -> String {
+        serde_json::json!({
+            "type": line_type,
+            "data": {
+                "path": {"text": "test_file.rs"},
+                "lines": {"text": code},
+                "line_number": line_number,
+                "absolute_offset": 144,
+                "submatches": submatches.iter().map(|&(start, end)| serde_json::json!({
+                    "match": {"text": &code[start..end]}, "start": start, "end": end,
+                })).collect::<Vec<_>>(),
+            },
+        })
+        .to_string()
+    }
+
+    fn file_link_target(suffix: &str) -> String {
+        let path = crate::utils::path::fake_delta_cwd_for_tests().join("test_file.rs");
+        format!("\x1b]8;;file://{}{suffix}\x1b\\", path.display())
+    }
+
+    #[rstest]
+    fn test_ripgrep_hyperlink_column(#[values("ripgrep", "classic")] output_type: &str) {
+        let data = r#"{"type":"begin","data":{"path":{"text":"test_file.rs"}}}
+{"type":"match","data":{"path":{"text":"test_file.rs"},"lines":{"text":"        println!(\"Hello world! Try passing some arguments next time.\");\n"},"line_number":6,"absolute_offset":144,"submatches":[{"match":{"text":"world"},"start":24,"end":29}]}}
+{"type":"end","data":{"path":{"text":"test_file.rs"}}}
+{"type":"summary","data":{}}"#;
+        let result = hyperlink_test(output_type, "file://{path}:{line}:{column}")
+            .with_input(data)
+            .expect_raw_contains(&file_link_target(":6:25"));
+        if output_type == "ripgrep" {
+            result.expect_raw_contains(&file_link_target(":0:1"));
+        }
+    }
+
+    #[rstest]
+    #[case::multiple("match", "xx world world\n", &[(3, 8), (9, 14)], 4)]
+    #[case::first_byte("match", "world\n", &[(0, 5)], 1)]
+    #[case::zero_width("match", "world\n", &[(0, 0)], 1)]
+    #[case::empty_submatches("match", "other\n", &[], 1)]
+    #[case::context("context", "other\n", &[], 1)]
+    #[case::inverted_context("context", "xx world\n", &[(3, 8)], 1)]
+    #[case::utf8("match", "é world\n", &[(3, 8)], 4)]
+    #[case::crlf("match", "xx world\r\n", &[(3, 8)], 4)]
+    #[case::no_newline("match", "xx world", &[(3, 8)], 4)]
+    #[case::multiline("match", "xx world\nnext end\n", &[(3, 13)], 4)]
+    fn test_ripgrep_hyperlink_column_positions(
+        #[values("ripgrep", "classic")] output_type: &str,
+        #[case] line_type: &str,
+        #[case] code: &str,
+        #[case] submatches: &[(usize, usize)],
+        #[case] column: usize,
+    ) {
+        let data = match_record(line_type, code, Some(6), submatches);
+        let result = hyperlink_test(output_type, "file://{path}:{line}:{column}")
+            .with_input(&data)
+            .expect_raw_contains(&file_link_target(&format!(":6:{column}")));
+        let line_only = hyperlink_test(output_type, "file://{path}:{line}").with_input(&data);
+        assert_eq!(result.output, line_only.output);
+    }
+
+    #[rstest]
+    #[case::before_match("\tworld\n", &[(1, 6)], 2)]
+    #[case::after_match("world\t\n", &[(0, 5)], 1)]
+    fn test_ripgrep_hyperlink_column_ignores_tab_expansion(
+        #[values("ripgrep", "classic")] output_type: &str,
+        #[values(0, 4, 8)] tab_width: usize,
+        #[case] code: &str,
+        #[case] submatches: &[(usize, usize)],
+        #[case] column: usize,
+    ) {
+        hyperlink_test(output_type, "file://{path}:{line}:{column}")
+            .set_config(|config| config.tab_cfg = crate::utils::tabs::TabCfg::new(tab_width))
+            .with_input(&match_record("match", code, Some(6), submatches))
+            .expect_raw_contains(&file_link_target(&format!(":6:{column}")));
+    }
+
+    #[rstest]
+    #[case("file://{path}", "")]
+    #[case("file://{path}:{line}", ":6")]
+    fn test_ripgrep_hyperlink_column_is_opt_in(
+        #[values("ripgrep", "classic")] output_type: &str,
+        #[case] link_format: &str,
+        #[case] suffix: &str,
+    ) {
+        hyperlink_test(output_type, link_format)
+            .with_input(&match_record("match", "xx world\n", Some(6), &[(3, 8)]))
+            .expect_raw_contains(&file_link_target(suffix));
+    }
+
+    #[rstest]
+    fn test_ripgrep_hyperlink_column_without_line_number(
+        #[values("ripgrep", "classic")] output_type: &str,
+    ) {
+        let result = hyperlink_test(output_type, "file://{path}:{line}:{column}")
+            .with_input(&match_record("match", "xx world\n", None, &[(3, 8)]));
+        assert!(!result.output.contains("1:"));
+        assert_eq!(result.raw_output.matches("file://").count(), 1);
+        result.expect_raw_contains(&file_link_target(if output_type == "classic" {
+            ":1:4"
+        } else {
+            ":0:1"
+        }));
+    }
+
+    #[rstest]
+    fn test_ripgrep_hyperlink_column_with_hyperlinks_disabled(
+        #[values("ripgrep", "classic")] output_type: &str,
+    ) {
+        let data = match_record("match", "xx world\n", Some(6), &[(3, 8)]);
+        let test = hyperlink_test(output_type, "file://{path}:{line}:{column}");
+        let enabled = test.with_input(&data);
+        let disabled = test
+            .set_config(|config| config.hyperlinks = false)
+            .with_input(&data);
+        assert!(!disabled.raw_output.contains("\x1b]8;"));
+        assert_eq!(disabled.output, enabled.output);
+    }
+
+    #[test]
+    fn test_non_json_grep_hyperlink_column_defaults_to_one() {
+        hyperlink_test("classic", "file://{path}:{line}:{column}")
+            .with_calling_process("git grep -n world")
+            .with_input("test_file.rs:6:xx world")
+            .expect_raw_contains(&file_link_target(":6:1"));
+    }
 
     /* FILE test.c:
     // i ABC
