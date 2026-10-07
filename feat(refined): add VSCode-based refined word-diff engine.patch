@@ -1,0 +1,1934 @@
+From 30ccdade0067bf2a7613b99c1d65cfeddf0b86a1 Mon Sep 17 00:00:00 2001
+From: CnsMaple <czy797@outlook.com>
+Date: Thu, 17 Sep 2026 15:58:44 +0800
+Subject: [PATCH] feat(refined): add VSCode-based refined word-diff engine
+
+Add a --word-diff-engine option (delta | refined, default delta). The "refined"
+engine infers intra-line changes by treating each hunk's deletion run against its
+addition run as one character-level change block, based on VSCode's
+DefaultLinesDiffComputer (ported in src/refined_diff.rs): DP/LCS + Myers plus the
+optimize/extend/remove-short/remove-very-short refine chain, with precise-mode
+tweaks.
+
+Behaviour:
+- empty-change bars render as one-cell placeholders (braille blank) coloured by
+  the opposite side: a minus-side bar = green (an addition), a plus-side bar = red
+  (a deletion). Syntax highlighting runs on widened lines to keep delta's
+  per-character superimpose invariant.
+- the "\ No newline at end of file" marker is transparent, so a deletion run pairs
+  with the following addition run instead of splitting into whole lines.
+- short common runs are kept (remove_short_matches gap <= 1) and whitespace /
+  indentation changes are marked; incidental space<->space reflow noise is dropped.
+- a reflow junction placeholder marks where a split/joined line's content
+  continues, only when the extra lines are a reflow (not a genuinely new line).
+
+Selectable via CLI, git config delta.word-diff-engine, and reported by
+--show-config. The default Levenshtein path is unchanged.
+
+Also add a fork-only .github/workflows/release.yml (multi-platform build + GitHub
+Release assets, without the upstream cargo/winget publish jobs).
+---
+ .github/workflows/{cd.yml => release.yml} |   39 +-
+ src/cli.rs                                |   23 +
+ src/config.rs                             |    2 +
+ src/edits.rs                              |  155 +++
+ src/handlers/hunk.rs                      |   10 +
+ src/main.rs                               |    1 +
+ src/options/set.rs                        |   17 +
+ src/paint.rs                              |   93 +-
+ src/refined_diff.rs                       | 1373 +++++++++++++++++++++
+ src/subcommands/show_config.rs            |    7 +-
+ 10 files changed, 1685 insertions(+), 35 deletions(-)
+ rename .github/workflows/{cd.yml => release.yml} (76%)
+ create mode 100644 src/refined_diff.rs
+
+diff --git a/.github/workflows/cd.yml b/.github/workflows/release.yml
+similarity index 76%
+rename from .github/workflows/cd.yml
+rename to .github/workflows/release.yml
+index 92eba57dc..17aa909bf 100644
+--- a/.github/workflows/cd.yml
++++ b/.github/workflows/release.yml
+@@ -1,10 +1,18 @@
+-name: Continuous Deployment
++name: Release
++
++# Fork-only release workflow: build multi-platform binaries and upload them to a
++# GitHub Release on a version tag push. Derived from the upstream cd.yml but with
++# the publish-to-cargo / publish-to-winget / verify-release jobs removed (a fork
++# must not publish to the upstream crate or winget id).
+ 
+ on:
+   push:
+     tags:
+       - '[0-9]+.[0-9]+.[0-9]+'
+ 
++permissions:
++  contents: write
++
+ jobs:
+   publish:
+     name: Publishing for ${{ matrix.job.os }}
+@@ -81,36 +89,9 @@ jobs:
+       - name: Releasing assets
+         uses: softprops/action-gh-release@v2
+         with:
+-          draft: true
++          draft: false
+           files: |
+             delta-*-${{ matrix.job.target }}.*
+             git-delta*.deb
+         env:
+           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+-
+-  verify-release:
+-    needs: publish
+-    uses: ./.github/workflows/verify-release.yml
+-    with:
+-      version: ${{ github.ref_name }}
+-    secrets: inherit
+-
+-  publish-to-cargo:
+-    name: Publishing to Cargo
+-    runs-on: ubuntu-latest
+-    steps:
+-      - uses: actions/checkout@v4
+-      - uses: dtolnay/rust-toolchain@stable
+-      - run: cargo publish --token ${{ secrets.CARGO_API_KEY }} --allow-dirty
+-
+-  publish-to-winget:
+-    name: Publish to WinGet
+-    runs-on: ubuntu-latest
+-    needs: publish
+-    steps:
+-      - uses: vedantmgoyal2009/winget-releaser@v2
+-        with:
+-          identifier: dandavison.delta
+-          version: ${{ github.ref_name }}
+-          installers-regex: '-pc-windows-msvc\.zip$'
+-          token: ${{ secrets.WINGET_TOKEN }}
+diff --git a/src/cli.rs b/src/cli.rs
+index 544b25ceb..7e36cab58 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -466,6 +466,21 @@ pub struct Opt {
+     /// Git's --color-moved feature. Set this to "false" to disable this behavior.
+     pub inspect_raw_lines: String,
+ 
++    #[arg(
++        long = "word-diff-engine",
++        default_value = "delta",
++        value_name = "delta|refined",
++        value_parser = ["delta", "refined"],
++    )]
++    /// Algorithm used to infer word-level (intra-line) changes within a change block.
++    ///
++    /// "delta" (default) uses delta's token-level Levenshtein edit-inference. "refined"
++    /// treats each hunk's whole deletion run against its addition run as a single
++    /// character-level change block, based on VSCode's diff algorithm (DP/LCS + Myers
++    /// plus the refine heuristic chain), with precise-mode tweaks (short common runs are
++    /// kept, and whitespace/indentation changes are marked).
++    pub word_diff_engine: String,
++
+     #[arg(long = "keep-plus-minus-markers")]
+     /// Prefix added/removed lines with a +/- character, as git does.
+     ///
+@@ -1181,6 +1196,7 @@ pub struct ComputedValues {
+     pub background_color_extends_to_terminal_width: bool,
+     pub decorations_width: Width,
+     pub inspect_raw_lines: InspectRawLines,
++    pub word_diff_engine: WordDiffEngine,
+     pub color_mode: ColorMode,
+     pub paging_mode: PagingMode,
+     pub syntax_set: SyntaxSet,
+@@ -1202,6 +1218,13 @@ pub enum InspectRawLines {
+     False,
+ }
+ 
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum WordDiffEngine {
++    #[default]
++    Delta,
++    Refined,
++}
++
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+ pub enum DetectDarkLight {
+     /// Only query the terminal for its colors if the output is not redirected.
+diff --git a/src/config.rs b/src/config.rs
+index 1c01530a6..2b6a67a32 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -91,6 +91,7 @@ pub struct Config {
+     pub hyperlinks: bool,
+     pub inline_hint_style: Style,
+     pub inspect_raw_lines: cli::InspectRawLines,
++    pub word_diff_engine: cli::WordDiffEngine,
+     pub keep_plus_minus_markers: bool,
+     pub line_buffer_size: usize,
+     pub line_fill_method: BgFillMethod,
+@@ -363,6 +364,7 @@ impl From<cli::Opt> for Config {
+             hyperlinks_commit_link_format: opt.hyperlinks_commit_link_format,
+             hyperlinks_file_link_format: opt.hyperlinks_file_link_format,
+             inspect_raw_lines: opt.computed.inspect_raw_lines,
++            word_diff_engine: opt.computed.word_diff_engine,
+             inline_hint_style: styles["inline-hint-style"],
+             keep_plus_minus_markers: opt.keep_plus_minus_markers,
+             line_fill_method: if !opt.computed.stdout_is_term && !TESTING {
+diff --git a/src/edits.rs b/src/edits.rs
+index 30d299584..87d2d1d41 100644
+--- a/src/edits.rs
++++ b/src/edits.rs
+@@ -4,7 +4,10 @@ use unicode_segmentation::UnicodeSegmentation;
+ use unicode_width::UnicodeWidthStr;
+ 
+ use crate::align;
++use crate::delta::State;
+ use crate::minusplus::MinusPlus;
++use crate::style::Style;
++use crate::refined_diff;
+ 
+ /// Infer the edit operations responsible for the differences between a collection of old and new
+ /// lines. A "line" is a string. An annotated line is a Vec of (op, &str) pairs, where the &str
+@@ -135,6 +138,158 @@ pub fn make_lines_have_homolog(
+     )
+ }
+ 
++/// VSCode-accurate word-diff for a whole change block, with line widening.
++///
++/// Treats the collected minus run vs plus run as ONE character-level change
++/// block (see [`refined_diff`]), then renders each line into a WIDENED owned
++/// `String`: a mid-line empty-change bar becomes a one-cell placeholder (a
++/// space) so the marker no longer recolors a real content character (e.g. a
++/// trailing `)` or a line-initial `r`). Leading/trailing bars are dropped (the
++/// counterpart line already has its own row in side-by-side).
++///
++/// Returns owned widened `(String, State)` lines per side, per-line style ranges
++/// `(Style, byte_start, byte_end)` into those strings, and the positional line
++/// alignment. The caller builds `LineSections` (borrowing the widened strings)
++/// and computes syntax highlighting from the widened strings, so delta's
++/// per-character superimpose invariant stays intact.
++#[allow(clippy::too_many_arguments)]
++#[allow(clippy::type_complexity)]
++pub fn refined_widen<'a>(
++    minus_lines: &[&'a str],
++    plus_lines: &[&'a str],
++    minus_styles: &[Style],
++    plus_styles: &[Style],
++    minus_emph: Style,
++    plus_emph: Style,
++    minus_states: &[State],
++    plus_states: &[State],
++) -> (
++    Vec<(String, State)>,
++    Vec<(String, State)>,
++    Vec<Vec<(Style, usize, usize)>>,
++    Vec<Vec<(Style, usize, usize)>>,
++    Vec<(Option<usize>, Option<usize>)>,
++) {
++    let (mut del_spans, mut ins_spans) = refined_diff::block_diff_runs(minus_lines, plus_lines);
++
++    // Junction placeholder: when one side has more lines than the other AND those
++    // extra lines are a reflow of content that exists on the other side (a line was
++    // split/joined), mark the end of the last positionally-paired line on the longer
++    // side with a placeholder in the SHORTER side's colour. A genuinely new line
++    // (e.g. an added import) is NOT a reflow, so it gets no junction marker.
++    if ins_spans.len() > del_spans.len()
++        && is_reflow(&plus_lines[minus_lines.len()..], minus_lines)
++    {
++        let idx = del_spans.len().saturating_sub(1).min(ins_spans.len() - 1);
++        push_junction(&mut ins_spans[idx], refined_diff::Mark::Del);
++    }
++    if del_spans.len() > ins_spans.len()
++        && is_reflow(&minus_lines[plus_lines.len()..], plus_lines)
++    {
++        let idx = ins_spans.len().saturating_sub(1).min(del_spans.len() - 1);
++        push_junction(&mut del_spans[idx], refined_diff::Mark::Ins);
++    }
++
++    // block_diff_runs already decides which whitespace marks to keep (pure-indent
++    // pairs, newline boundaries, real insertions); here we widen each line and pick
++    // the emphasis colour from the span's own mark (Del -> minus emph, Ins -> plus
++    // emph), so a junction placeholder can be coloured as a deletion on the plus side.
++    let widen_side = |spans: Vec<Vec<refined_diff::DiffSpan>>,
++                      styles: &[Style],
++                      minus_emph: Style,
++                      plus_emph: Style,
++                      states: &[State]|
++     -> (Vec<(String, State)>, Vec<Vec<(Style, usize, usize)>>) {
++        let mut lines_out = Vec::with_capacity(spans.len());
++        let mut ranges_out = Vec::with_capacity(spans.len());
++        for (i, spans) in spans.into_iter().enumerate() {
++            let w = refined_diff::widen_line(&spans);
++            let base = styles[i];
++            let ranges: Vec<(Style, usize, usize)> = w
++                .ranges
++                .into_iter()
++                .map(|(m, a, b)| {
++                    let st = match m {
++                        Some(refined_diff::Mark::Del) => minus_emph,
++                        Some(refined_diff::Mark::Ins) => plus_emph,
++                        None => base,
++                    };
++                    (st, a, b)
++                })
++                .collect();
++            lines_out.push((w.text, states[i].clone()));
++            ranges_out.push(ranges);
++        }
++        (lines_out, ranges_out)
++    };
++
++    let (widened_minus, ranges_minus) =
++        widen_side(del_spans, minus_styles, minus_emph, plus_emph, minus_states);
++    let (widened_plus, ranges_plus) =
++        widen_side(ins_spans, plus_styles, minus_emph, plus_emph, plus_states);
++
++    // Positional pairing, as VSCode lays out a change block.
++    let mut line_alignment: Vec<(Option<usize>, Option<usize>)> = Vec::new();
++    let n_pair = minus_lines.len().min(plus_lines.len());
++    for i in 0..n_pair {
++        line_alignment.push((Some(i), Some(i)));
++    }
++    for i in n_pair..minus_lines.len() {
++        line_alignment.push((Some(i), None));
++    }
++    for j in n_pair..plus_lines.len() {
++        line_alignment.push((None, Some(j)));
++    }
++
++    (
++        widened_minus,
++        widened_plus,
++        ranges_minus,
++        ranges_plus,
++        line_alignment,
++    )
++}
++
++/// True when every `extra` line is a reflow of content already present in `other`
++/// (its trimmed text is a substring of the other run's trimmed content). Used to
++/// distinguish a split/join (reflow -> junction) from a genuinely new line.
++fn is_reflow<'a>(extra: &[&'a str], other: &[&'a str]) -> bool {
++    if extra.is_empty() {
++        return false;
++    }
++    let hay: String = other.iter().map(|l| format!("{}\n", l.trim())).collect();
++    extra.iter().all(|l| {
++        let t = l.trim();
++        !t.is_empty() && hay.contains(t)
++    })
++}
++
++/// Insert a placeholder bar at a line's content end (before its trailing newline),
++/// used for the reflow junction marker. Splits the last span's trailing '\n' off so
++/// the placeholder sits at the visible end of the line, not after the newline.
++fn push_junction(spans: &mut Vec<refined_diff::DiffSpan>, mark: refined_diff::Mark) {
++    let bar = refined_diff::DiffSpan {
++        text: "",
++        mark: Some(mark),
++        spans_line: false,
++    };
++    if let Some(last) = spans.last_mut() {
++        if last.mark.is_none() && last.text.ends_with('\n') && last.text.len() > 1 {
++            let cut = last.text.len() - 1; // '\n' is a single byte
++            let nl = &last.text[cut..];
++            last.text = &last.text[..cut];
++            spans.push(bar);
++            spans.push(refined_diff::DiffSpan {
++                text: nl,
++                mark: None,
++                spans_line: false,
++            });
++            return;
++        }
++    }
++    spans.push(bar);
++}
++
+ /// Split line into tokens for alignment. The alignment algorithm aligns sequences of substrings;
+ /// not individual characters.
+ fn tokenize<'a>(line: &'a str, regex: &Regex) -> Vec<&'a str> {
+diff --git a/src/handlers/hunk.rs b/src/handlers/hunk.rs
+index 073ce9089..2d816f71c 100644
+--- a/src/handlers/hunk.rs
++++ b/src/handlers/hunk.rs
+@@ -119,6 +119,16 @@ impl StateMachine<'_> {
+                 // The first character here could be e.g. '\' from '\ No newline at end of file'. This
+                 // is not a hunk line, but the parser does not have a more accurate state corresponding
+                 // to this.
++                if self.config.word_diff_engine == cli::WordDiffEngine::Refined
++                    && self.line.starts_with('\\')
++                {
++                    // The refined engine keeps a deletion run and the following addition
++                    // run in ONE change block across the no-newline marker (the marker is
++                    // transparent to the diff). Do not flush the buffers, emit, or change
++                    // state, so the block stays contiguous and the deletion pairs with the
++                    // addition.
++                    return Ok(true);
++                }
+                 self.painter.paint_buffered_minus_and_plus_lines();
+                 self.painter
+                     .output_buffer
+diff --git a/src/main.rs b/src/main.rs
+index e952a3bcb..50343b278 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -18,6 +18,7 @@ mod parse_style;
+ mod parse_styles;
+ mod style;
+ mod utils;
++mod refined_diff;
+ mod wrapping;
+ 
+ mod subcommands;
+diff --git a/src/options/set.rs b/src/options/set.rs
+index 42f49f15f..355d0a1db 100644
+--- a/src/options/set.rs
++++ b/src/options/set.rs
+@@ -170,6 +170,7 @@ pub fn set_options(
+             hyperlinks_file_link_format,
+             inline_hint_style,
+             inspect_raw_lines,
++            word_diff_engine,
+             keep_plus_minus_markers,
+             line_buffer_size,
+             map_styles,
+@@ -240,6 +241,7 @@ pub fn set_options(
+     theme::set__color_mode__syntax_theme__syntax_set(opt, assets);
+     opt.computed.inspect_raw_lines =
+         cli::InspectRawLines::from_str(&opt.inspect_raw_lines).unwrap();
++    opt.computed.word_diff_engine = cli::WordDiffEngine::from_str(&opt.word_diff_engine).unwrap();
+     opt.computed.paging_mode = parse_paging_mode(&opt.paging_mode);
+ 
+     // --color-only is used for interactive.diffFilter (git add -p). side-by-side, and
+@@ -545,6 +547,21 @@ impl FromStr for cli::InspectRawLines {
+     }
+ }
+ 
++impl FromStr for cli::WordDiffEngine {
++    type Err = Error;
++    fn from_str(s: &str) -> Result<Self, Self::Err> {
++        match s.to_lowercase().as_str() {
++            "delta" => Ok(Self::Delta),
++            "refined" => Ok(Self::Refined),
++            _ => {
++                fatal(format!(
++                    r#"Invalid value for word-diff-engine option: {s}. Valid values are "delta", and "refined"."#,
++                ));
++            }
++        }
++    }
++}
++
+ fn parse_paging_mode(paging_mode_string: &str) -> PagingMode {
+     match paging_mode_string.to_lowercase().as_str() {
+         "always" => PagingMode::Always,
+diff --git a/src/paint.rs b/src/paint.rs
+index 4e473afa6..09ae0a3cc 100644
+--- a/src/paint.rs
++++ b/src/paint.rs
+@@ -610,11 +610,94 @@ pub fn paint_minus_and_plus_lines(
+     output_buffer: &mut String,
+     config: &config::Config,
+ ) {
+-    let syntax_style_sections = MinusPlus::new(
+-        get_syntax_style_sections_for_lines(lines[Minus], highlighter.as_mut(), config),
+-        get_syntax_style_sections_for_lines(lines[Plus], highlighter.as_mut(), config),
+-    );
+-    let (mut diff_style_sections, line_alignment) = get_diff_style_sections(&lines, config);
++    if config.word_diff_engine == crate::cli::WordDiffEngine::Refined {
++        // Refined engine: widen lines so empty-change bars become their own
++        // placeholder cell. Syntax highlighting is computed from the WIDENED
++        // lines so it stays character-for-character consistent with the diff
++        // sections (delta superimposes them).
++        let m_lines: Vec<&str> = lines[Minus].iter().map(|(s, _)| s.as_str()).collect();
++        let p_lines: Vec<&str> = lines[Plus].iter().map(|(s, _)| s.as_str()).collect();
++        let m_styles: Vec<Style> = lines[Minus]
++            .iter()
++            .map(|(_, st)| *config.get_style(st))
++            .collect();
++        let p_styles: Vec<Style> = lines[Plus]
++            .iter()
++            .map(|(_, st)| *config.get_style(st))
++            .collect();
++        let m_states: Vec<State> = lines[Minus].iter().map(|(_, st)| st.clone()).collect();
++        let p_states: Vec<State> = lines[Plus].iter().map(|(_, st)| st.clone()).collect();
++
++        let (wm, wp, rm, rp, line_alignment) = edits::refined_widen(
++            &m_lines,
++            &p_lines,
++            &m_styles,
++            &p_styles,
++            config.minus_emph_style,
++            config.plus_emph_style,
++            &m_states,
++            &p_states,
++        );
++
++        let syntax_style_sections = MinusPlus::new(
++            get_syntax_style_sections_for_lines(&wm, highlighter.as_mut(), config),
++            get_syntax_style_sections_for_lines(&wp, highlighter.as_mut(), config),
++        );
++        let diff_style_sections = MinusPlus::new(
++            wm.iter()
++                .zip(&rm)
++                .map(|((s, _), rg)| {
++                    rg.iter()
++                        .map(|(st, a, b)| (*st, &s[*a..*b]))
++                        .collect::<LineSections<Style>>()
++                })
++                .collect(),
++            wp.iter()
++                .zip(&rp)
++                .map(|((s, _), rg)| {
++                    rg.iter()
++                        .map(|(st, a, b)| (*st, &s[*a..*b]))
++                        .collect::<LineSections<Style>>()
++                })
++                .collect(),
++        );
++        finish_minus_and_plus(
++            MinusPlus::new(&wm, &wp),
++            syntax_style_sections,
++            diff_style_sections,
++            line_alignment,
++            line_numbers_data,
++            output_buffer,
++            config,
++        );
++    } else {
++        let syntax_style_sections = MinusPlus::new(
++            get_syntax_style_sections_for_lines(lines[Minus], highlighter.as_mut(), config),
++            get_syntax_style_sections_for_lines(lines[Plus], highlighter.as_mut(), config),
++        );
++        let (diff_style_sections, line_alignment) = get_diff_style_sections(&lines, config);
++        finish_minus_and_plus(
++            lines,
++            syntax_style_sections,
++            diff_style_sections,
++            line_alignment,
++            line_numbers_data,
++            output_buffer,
++            config,
++        );
++    }
++}
++
++#[allow(clippy::too_many_arguments)]
++fn finish_minus_and_plus<'a>(
++    lines: MinusPlus<&'a Vec<(String, State)>>,
++    syntax_style_sections: MinusPlus<Vec<LineSections<'a, SyntectStyle>>>,
++    mut diff_style_sections: MinusPlus<Vec<LineSections<'a, Style>>>,
++    line_alignment: Vec<(Option<usize>, Option<usize>)>,
++    line_numbers_data: &mut Option<LineNumbersData>,
++    output_buffer: &mut String,
++    config: &config::Config,
++) {
+     let lines_have_homolog = edits::make_lines_have_homolog(&line_alignment);
+     Painter::update_diff_style_sections(
+         lines[Minus],
+diff --git a/src/refined_diff.rs b/src/refined_diff.rs
+new file mode 100644
+index 000000000..2156a3f88
+--- /dev/null
++++ b/src/refined_diff.rs
+@@ -0,0 +1,1373 @@
++//! Character-level "word diff" marking, ported from
++//! dsh-plugin-git `src/client/diff.ts`, which itself ports VSCode's
++//! `vs/editor/common/diff/defaultLinesDiffComputer` (MIT).
++//!
++//! It replaces delta's token-level Levenshtein edit inference (`align.rs` /
++//! `edits.rs`) with VSCode's exact algorithm chain for marking the changed
++//! characters *within* an already line-paired change block:
++//!
++//! 1. Both sides become character sequences over their TRIMMED lines joined by
++//!    `\n` elements (`CharSeq`, VSCode's `LinesSliceCharSequence` with
++//!    `ignoreTrimWhitespace=true`).
++//! 2. One sequence diff over the whole block — DP LCS below 500 elements
++//!    (diagonal-preferring), Myers `O(ND)` above.
++//! 3. The heuristic chain, exactly as `refineDiff` orders it:
++//!    `optimize_sequence_diffs` (join-by-shifting twice, then boundary-score
++//!    shifting), `extend_diffs_to_words`, `remove_short_matches` (equal gaps of
++//!    at most 2 chars merge), `remove_very_short_matching_text` (cap-130 power
++//!    formula + short prefix/suffix extension to whole lines).
++//! 4. Ranges map back to per-line spans; whitespace outside the trimmed range is
++//!    never marked.
++//!
++//! Git already fixed line pairing, so the line-alignment stage is not re-run:
++//! each hunk's deletion run against its addition run is one change block.
++//!
++//! ponytail: elements are Unicode scalars (`char`), whereas VSCode / the TS
++//! source use UTF-16 code units. This is identical for BMP text (the practical
++//! case, incl. CJK); astral-plane characters (e.g. emoji) count as 1 element
++//! here vs 2 in VSCode. Upgrade path: switch `elements` to `Vec<u16>` via
++//! `encode_utf16` if exact astral parity is ever needed.
++
++use std::cmp::min;
++use std::collections::HashMap;
++
++/// Above this product, a block falls back to whole-line marks — the viewer bound
++/// VSCode expresses as its time budget.
++const BLOCK_PRODUCT_LIMIT: i64 = 25_000_000;
++/// Below this combined length the sequence diff uses the DP table, as VSCode's
++/// refineDiff selects.
++const DP_LENGTH_LIMIT: i64 = 500;
++
++/// Word-level emphasis on one side of a diff.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Mark {
++    Del,
++    Ins,
++}
++
++/// One marked or plain piece of a diff line. `text` is a slice of the original
++/// line; `mark == None` means the text survives on both sides.
++///
++/// For a zero-width bar (`text.is_empty()`), `spans_line` records whether the
++/// other side's change covers a whole line (its range includes a `\n` separator).
++/// Such a bar is redundant in side-by-side (the counterpart line has its own row)
++/// and is dropped; an intra-line bar is kept and rendered as a placeholder cell.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct DiffSpan<'a> {
++    pub text: &'a str,
++    pub mark: Option<Mark>,
++    pub spans_line: bool,
++}
++
++// ───────────────────────────────── ranges ─────────────────────────────────
++
++/// A half-open offset range, mirroring VSCode's `OffsetRange`. Indices are `i64`
++/// to mirror JS number arithmetic (no unsigned underflow during shifting).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++struct OffsetRange {
++    start: i64,
++    end: i64, // endExclusive
++}
++
++impl OffsetRange {
++    fn len(self) -> i64 {
++        self.end - self.start
++    }
++    fn is_empty(self) -> bool {
++        self.end <= self.start
++    }
++}
++
++fn join_ranges(a: OffsetRange, b: OffsetRange) -> OffsetRange {
++    OffsetRange {
++        start: a.start.min(b.start),
++        end: a.end.max(b.end),
++    }
++}
++
++fn intersect_ranges(a: OffsetRange, b: OffsetRange) -> Option<OffsetRange> {
++    let start = a.start.max(b.start);
++    let end = a.end.min(b.end);
++    if start <= end {
++        Some(OffsetRange { start, end })
++    } else {
++        None
++    }
++}
++
++fn intersects_ranges(a: OffsetRange, b: OffsetRange) -> bool {
++    a.start < b.end && b.start < a.end
++}
++
++/// One change between the two sequences: a range on each side at once.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++struct SequenceDiff {
++    seq1: OffsetRange,
++    seq2: OffsetRange,
++}
++
++fn diff_ends(d: SequenceDiff) -> (i64, i64) {
++    (d.seq1.end, d.seq2.end)
++}
++
++fn join_diffs(a: SequenceDiff, b: SequenceDiff) -> SequenceDiff {
++    SequenceDiff {
++        seq1: join_ranges(a.seq1, b.seq1),
++        seq2: join_ranges(a.seq2, b.seq2),
++    }
++}
++
++fn delta_diff(d: SequenceDiff, offset: i64) -> SequenceDiff {
++    SequenceDiff {
++        seq1: OffsetRange {
++            start: d.seq1.start + offset,
++            end: d.seq1.end + offset,
++        },
++        seq2: OffsetRange {
++            start: d.seq2.start + offset,
++            end: d.seq2.end + offset,
++        },
++    }
++}
++
++fn delta_start_diff(d: SequenceDiff, offset: i64) -> SequenceDiff {
++    SequenceDiff {
++        seq1: OffsetRange {
++            start: d.seq1.start + offset,
++            end: d.seq1.end,
++        },
++        seq2: OffsetRange {
++            start: d.seq2.start + offset,
++            end: d.seq2.end,
++        },
++    }
++}
++
++fn delta_end_diff(d: SequenceDiff, offset: i64) -> SequenceDiff {
++    SequenceDiff {
++        seq1: OffsetRange {
++            start: d.seq1.start,
++            end: d.seq1.end + offset,
++        },
++        seq2: OffsetRange {
++            start: d.seq2.start,
++            end: d.seq2.end + offset,
++        },
++    }
++}
++
++fn intersect_diffs(a: SequenceDiff, b: SequenceDiff) -> Option<SequenceDiff> {
++    let s1 = intersect_ranges(a.seq1, b.seq1)?;
++    let s2 = intersect_ranges(a.seq2, b.seq2)?;
++    Some(SequenceDiff { seq1: s1, seq2: s2 })
++}
++
++/// The equal runs between the given diffs, as `SequenceDiff.invert`.
++fn invert_diffs(
++    diffs: &[SequenceDiff],
++    doc1_length: i64,
++    doc2_length: i64,
++) -> Vec<SequenceDiff> {
++    let mut result: Vec<SequenceDiff> = Vec::new();
++    let mut prev: Option<SequenceDiff> = None;
++    for cur in diffs {
++        let start = prev.map(diff_ends).unwrap_or((0, 0));
++        result.push(SequenceDiff {
++            seq1: OffsetRange {
++                start: start.0,
++                end: cur.seq1.start,
++            },
++            seq2: OffsetRange {
++                start: start.1,
++                end: cur.seq2.start,
++            },
++        });
++        prev = Some(*cur);
++    }
++    let start = prev.map(diff_ends).unwrap_or((0, 0));
++    result.push(SequenceDiff {
++        seq1: OffsetRange {
++            start: start.0,
++            end: doc1_length,
++        },
++        seq2: OffsetRange {
++            start: start.1,
++            end: doc2_length,
++        },
++    });
++    result
++}
++
++// ───────────────────────────────── sequences ─────────────────────────────────
++
++/// One side of a block: its lines trimmed and joined by `\n` elements, mirroring
++/// `LinesSliceCharSequence` with `considerWhitespaceChanges=false`.
++struct CharSeq {
++    /// Chars of the trimmed lines, separated by `'\n'`.
++    elements: Vec<char>,
++    /// Element offset where each line's trimmed text starts.
++    line_start: Vec<usize>,
++    /// Element offset just past each line's trimmed text (its separator, or end).
++    line_trimmed_end: Vec<usize>,
++    /// Leading-whitespace width per line. Kept 0 in whitespace-aware mode (leading
++    /// whitespace is now part of the diffed elements, so marks may cover it).
++    trimmed_ws: Vec<usize>,
++    /// Per line: byte offsets of each char plus a final `line.len()`, for
++    /// mapping char indices back into the original `&str`.
++    char_bytes: Vec<Vec<usize>>,
++}
++
++impl CharSeq {
++    fn new(lines: &[&str]) -> Self {
++        let mut elements: Vec<char> = Vec::new();
++        let mut line_start = Vec::with_capacity(lines.len());
++        let mut line_trimmed_end = Vec::with_capacity(lines.len());
++        let mut trimmed_ws = Vec::with_capacity(lines.len());
++        let mut char_bytes = Vec::with_capacity(lines.len());
++        for (at, line) in lines.iter().enumerate() {
++            // byte offsets of every char, plus the terminator
++            let mut offs: Vec<usize> = line.char_indices().map(|(i, _)| i).collect();
++            offs.push(line.len());
++            char_bytes.push(offs);
++
++            // Consider whitespace changes (VSCode's considerWhitespaceChanges=true):
++            // keep leading/trailing whitespace so indentation changes are marked,
++            // and only strip the single '\n' that delta's prepare() appends.
++            let body = line.strip_suffix('\n').unwrap_or(line);
++            trimmed_ws.push(0);
++            line_start.push(elements.len());
++            elements.extend(body.chars());
++            line_trimmed_end.push(elements.len());
++            if at < lines.len() - 1 {
++                elements.push('\n');
++            }
++        }
++        Self {
++            elements,
++            line_start,
++            line_trimmed_end,
++            trimmed_ws,
++            char_bytes,
++        }
++    }
++
++    fn length(&self) -> i64 {
++        self.elements.len() as i64
++    }
++
++    /// Char at element `offset`; out of range yields `'\u{0}'` so that two
++    /// out-of-range accesses compare equal, matching JS `arr[i]` semantics.
++    fn element(&self, offset: i64) -> char {
++        *self
++            .elements
++            .get(offset.max(0) as usize)
++            .unwrap_or(&'\u{0}')
++    }
++
++    fn is_strongly_equal(&self, offset1: i64, offset2: i64) -> bool {
++        self.element(offset1) == self.element(offset2)
++    }
++
++    fn text(&self, range: OffsetRange) -> String {
++        let start = range.start.max(0) as usize;
++        let end = (range.end as usize).min(self.elements.len());
++        self.elements[start..end].iter().collect()
++    }
++
++    /// `translateOffset`: the line index a sequence offset falls on.
++    fn line_of(&self, offset: i64) -> usize {
++        let offset = offset.clamp(0, self.length());
++        let mut low = 0usize;
++        let mut high = self.line_start.len() - 1;
++        while low < high {
++            let mid = (low + high + 1) >> 1;
++            if self.line_start[mid] as i64 <= offset {
++                low = mid;
++            } else {
++                high = mid - 1;
++            }
++        }
++        low
++    }
++
++    /// `countLinesIn`: the line-number delta between the range's ends.
++    fn count_lines_in(&self, range: OffsetRange) -> usize {
++        let end = range.end.min(self.length());
++        self.line_of(end) - self.line_of(range.start)
++    }
++
++    /// `extendToFullLines`: the element range of every line the range touches.
++    fn extend_to_full_lines(&self, range: OffsetRange) -> OffsetRange {
++        let mut start_line = 0usize;
++        for (at, &s) in self.line_start.iter().enumerate() {
++            if s as i64 <= range.start {
++                start_line = at;
++            }
++        }
++        let mut end = self.length();
++        for (at, &s) in self.line_start.iter().enumerate() {
++            if range.end <= s as i64 {
++                end = s as i64;
++                break;
++            }
++            let _ = at;
++        }
++        OffsetRange {
++            start: self.line_start[start_line] as i64,
++            end,
++        }
++    }
++
++    /// `findWordContaining`: ASCII letters/digits, as VSCode's `isWordChar`.
++    fn find_word_containing(&self, offset: i64) -> Option<OffsetRange> {
++        if offset < 0 || offset >= self.length() || !is_word_char(char_code(self.element(offset)))
++        {
++            return None;
++        }
++        let mut start = offset;
++        while start > 0
++            && is_word_char(char_code(self.element(start - 1)))
++        {
++            start -= 1;
++        }
++        let mut end = offset;
++        while end < self.length() && is_word_char(char_code(self.element(end))) {
++            end += 1;
++        }
++        Some(OffsetRange { start, end })
++    }
++
++    /// `getBoundaryScore`: the category table that anchors insertion placement.
++    fn boundary_score(&self, length: i64) -> i64 {
++        let prev = if length > 0 {
++            char_code(self.element(length - 1))
++        } else {
++            -1
++        };
++        let next = if length < self.length() {
++            char_code(self.element(length))
++        } else {
++            -1
++        };
++        let prev_cat = boundary_category(prev);
++        let next_cat = boundary_category(next);
++        if prev_cat == 7 && next_cat == 8 {
++            return 0;
++        }
++        if prev_cat == 8 {
++            return 150;
++        }
++        let mut score = 0;
++        if prev_cat != next_cat {
++            score += 10;
++            if prev_cat == 0 && next_cat == 1 {
++                score += 1;
++            }
++        }
++        score += CATEGORY_BOUNDARY[prev_cat as usize];
++        score += CATEGORY_BOUNDARY[next_cat as usize];
++        score
++    }
++
++    /// Slice `line` between char indices `[a, b)` using cached byte offsets.
++    fn slice<'a>(line: &'a str, bytes: &[usize], a: usize, b: usize) -> &'a str {
++        &line[bytes[a]..bytes[b]]
++    }
++}
++
++fn char_code(c: char) -> i64 {
++    c as u32 as i64
++}
++
++fn is_word_char(code: i64) -> bool {
++    (97..=122).contains(&code) || (65..=90).contains(&code) || (48..=57).contains(&code)
++}
++
++/// CharBoundaryCategory: 0 lower, 1 upper, 2 digit, 3 end, 4 other, 5 separator,
++/// 6 space, 7 CR, 8 LF.
++fn boundary_category(code: i64) -> i64 {
++    match code {
++        10 => 8,
++        13 => 7,
++        _ if is_space_code(code) => 6,
++        c if (97..=122).contains(&c) => 0,
++        c if (65..=90).contains(&c) => 1,
++        c if (48..=57).contains(&c) => 2,
++        -1 => 3,
++        44 | 59 => 5,
++        _ => 4,
++    }
++}
++
++fn is_space_code(code: i64) -> bool {
++    code == 32
++        || code == 9
++        || code == 11
++        || code == 12
++        || code == 0xa0
++        || code == 0x1680
++        || (0x2000..=0x200a).contains(&code)
++        || code == 0x2028
++        || code == 0x2029
++        || code == 0x202f
++        || code == 0x205f
++        || code == 0x3000
++        || code == 0xfeff
++}
++
++const CATEGORY_BOUNDARY: [i64; 9] = [0, 0, 0, 10, 2, 30, 3, 10, 10];
++
++// ───────────────────────────────── algorithms ─────────────────────────────────
++
++fn trivial_diff(seq1: &CharSeq, seq2: &CharSeq) -> SequenceDiff {
++    SequenceDiff {
++        seq1: OffsetRange {
++            start: 0,
++            end: seq1.length(),
++        },
++        seq2: OffsetRange {
++            start: 0,
++            end: seq2.length(),
++        },
++    }
++}
++
++/// DynamicProgrammingDiffing: LCS with diagonal preference (no equality score,
++/// as refineDiff calls it).
++fn dp_diff(seq1: &CharSeq, seq2: &CharSeq) -> Vec<SequenceDiff> {
++    if seq1.length() == 0 || seq2.length() == 0 {
++        return vec![trivial_diff(seq1, seq2)];
++    }
++    let n = seq1.length() as usize;
++    let m = seq2.length() as usize;
++    let cols = m + 1;
++    let mut lcs_lengths = vec![0i64; n * cols];
++    let mut directions = vec![0u8; n * cols];
++    let mut lengths = vec![0i64; n * cols];
++    for s1 in 0..n {
++        for s2 in 0..m {
++            let horizontal_len = if s1 == 0 { 0 } else { lcs_lengths[(s1 - 1) * cols + s2] };
++            let vertical_len = if s2 == 0 { 0 } else { lcs_lengths[s1 * cols + s2 - 1] };
++            let extended_seq_score: i64;
++            if seq1.element(s1 as i64) == seq2.element(s2 as i64) {
++                let mut sc = if s1 == 0 || s2 == 0 {
++                    0
++                } else {
++                    lcs_lengths[(s1 - 1) * cols + (s2 - 1)]
++                };
++                if s1 > 0 && s2 > 0 && directions[(s1 - 1) * cols + (s2 - 1)] == 3 {
++                    sc += lengths[(s1 - 1) * cols + (s2 - 1)];
++                }
++                sc += 1;
++                extended_seq_score = sc;
++            } else {
++                extended_seq_score = -1;
++            }
++            let new_value = horizontal_len.max(vertical_len).max(extended_seq_score);
++            if new_value == extended_seq_score {
++                lengths[s1 * cols + s2] =
++                    (if s1 > 0 && s2 > 0 {
++                        lengths[(s1 - 1) * cols + (s2 - 1)]
++                    } else {
++                        0
++                    }) + 1;
++                directions[s1 * cols + s2] = 3;
++            } else if new_value == horizontal_len {
++                lengths[s1 * cols + s2] = 0;
++                directions[s1 * cols + s2] = 1;
++            } else {
++                lengths[s1 * cols + s2] = 0;
++                directions[s1 * cols + s2] = 2;
++            }
++            lcs_lengths[s1 * cols + s2] = new_value;
++        }
++    }
++    let mut result: Vec<SequenceDiff> = Vec::new();
++    let mut last1 = n as i64;
++    let mut last2 = m as i64;
++    let report =
++        |result: &mut Vec<SequenceDiff>, s1: i64, s2: i64, last1: &mut i64, last2: &mut i64| {
++            if s1 + 1 != *last1 || s2 + 1 != *last2 {
++                result.push(SequenceDiff {
++                    seq1: OffsetRange {
++                        start: s1 + 1,
++                        end: *last1,
++                    },
++                    seq2: OffsetRange {
++                        start: s2 + 1,
++                        end: *last2,
++                    },
++                });
++            }
++            *last1 = s1;
++            *last2 = s2;
++        };
++    let mut s1 = n as i64 - 1;
++    let mut s2 = m as i64 - 1;
++    while s1 >= 0 && s2 >= 0 {
++        match directions[s1 as usize * cols + s2 as usize] {
++            3 => {
++                report(&mut result, s1, s2, &mut last1, &mut last2);
++                s1 -= 1;
++                s2 -= 1;
++            }
++            1 => s1 -= 1,
++            _ => s2 -= 1,
++        }
++    }
++    report(&mut result, -1, -1, &mut last1, &mut last2);
++    result.reverse();
++    result
++}
++
++/// MyersDiffAlgorithm: O(ND) with the diagonal bounds VSCode adds.
++fn myers_diff(seq1: &CharSeq, seq2: &CharSeq) -> Vec<SequenceDiff> {
++    if seq1.length() == 0 || seq2.length() == 0 {
++        return vec![trivial_diff(seq1, seq2)];
++    }
++    let n = seq1.length();
++    let m = seq2.length();
++    let get_x_after_snake = |x: i64, y: i64| -> i64 {
++        let mut x = x;
++        let mut y = y;
++        while x < n && y < m && seq1.element(x) == seq2.element(y) {
++            x += 1;
++            y += 1;
++        }
++        x
++    };
++    #[derive(Clone)]
++    struct Path {
++        prev: Option<Box<Path>>,
++        x: i64,
++        y: i64,
++        len: i64,
++    }
++    let mut v: HashMap<i64, i64> = HashMap::new();
++    let mut paths: HashMap<i64, Option<Box<Path>>> = HashMap::new();
++    let x0 = get_x_after_snake(0, 0);
++    v.insert(0, x0);
++    paths.insert(
++        0,
++        if x0 == 0 {
++            None
++        } else {
++            Some(Box::new(Path {
++                prev: None,
++                x: 0,
++                y: 0,
++                len: x0,
++            }))
++        },
++    );
++    let mut d: i64 = 0;
++    let mut k: i64 = 0;
++    let mut done = false;
++    while !done {
++        d += 1;
++        let lower_bound = -min(d, m + (d % 2));
++        let upper_bound = min(d, n + (d % 2));
++        let mut kk = lower_bound;
++        while kk <= upper_bound {
++            let max_xofd_line_top = if kk == upper_bound {
++                -1
++            } else {
++                *v.get(&(kk + 1)).unwrap_or(&-1)
++            };
++            let max_xofd_line_left = if kk == lower_bound {
++                -1
++            } else {
++                v.get(&(kk - 1)).copied().unwrap_or(-1) + 1
++            };
++            let x = max_xofd_line_top.max(max_xofd_line_left).min(n);
++            let y = x - kk;
++            if x > n || y > m {
++                kk += 2;
++                continue;
++            }
++            let new_max_x = get_x_after_snake(x, y);
++            v.insert(kk, new_max_x);
++            let last_path = if x == max_xofd_line_top {
++                paths.get(&(kk + 1)).cloned().unwrap_or(None)
++            } else {
++                paths.get(&(kk - 1)).cloned().unwrap_or(None)
++            };
++            paths.insert(
++                kk,
++                if new_max_x != x {
++                    Some(Box::new(Path {
++                        prev: last_path,
++                        x,
++                        y,
++                        len: new_max_x - x,
++                    }))
++                } else {
++                    last_path
++                },
++            );
++            if *v.get(&kk).unwrap_or(&-1) == n && (*v.get(&kk).unwrap_or(&-1) - kk) == m {
++                done = true;
++                k = kk;
++                break;
++            }
++            kk += 2;
++        }
++    }
++    let mut path = paths.get(&k).cloned().unwrap_or(None);
++    let mut result: Vec<SequenceDiff> = Vec::new();
++    let mut last1 = n;
++    let mut last2 = m;
++    loop {
++        let (end_x, end_y) = match &path {
++            Some(p) => (p.x + p.len, p.y + p.len),
++            None => (0, 0),
++        };
++        if end_x != last1 || end_y != last2 {
++            result.push(SequenceDiff {
++                seq1: OffsetRange {
++                    start: end_x,
++                    end: last1,
++                },
++                seq2: OffsetRange {
++                    start: end_y,
++                    end: last2,
++                },
++            });
++        }
++        match path {
++            Some(p) => {
++                last1 = p.x;
++                last2 = p.y;
++                path = p.prev;
++            }
++            None => break,
++        }
++    }
++    result.reverse();
++    result
++}
++
++// ───────────────────────────────── heuristics ─────────────────────────────────
++
++/// optimizeSequenceDiffs: join-by-shifting twice, then boundary-score shifting.
++fn optimize_sequence_diffs(
++    seq1: &CharSeq,
++    seq2: &CharSeq,
++    diffs: Vec<SequenceDiff>,
++) -> Vec<SequenceDiff> {
++    let result = join_sequence_diffs_by_shifting(seq1, seq2, diffs);
++    let result = join_sequence_diffs_by_shifting(seq1, seq2, result);
++    shift_sequence_diffs(seq1, seq2, result)
++}
++
++fn join_sequence_diffs_by_shifting(
++    seq1: &CharSeq,
++    seq2: &CharSeq,
++    diffs: Vec<SequenceDiff>,
++) -> Vec<SequenceDiff> {
++    if diffs.is_empty() {
++        return diffs;
++    }
++    let mut result: Vec<SequenceDiff> = vec![diffs[0]];
++    for i in 1..diffs.len() {
++        let prev_result = result[result.len() - 1];
++        let mut cur = diffs[i];
++        if cur.seq1.is_empty() || cur.seq2.is_empty() {
++            let length = cur.seq1.start - prev_result.seq1.end;
++            let mut d = 1i64;
++            while d <= length {
++                if seq1.element(cur.seq1.start - d) != seq1.element(cur.seq1.end - d)
++                    || seq2.element(cur.seq2.start - d) != seq2.element(cur.seq2.end - d)
++                {
++                    break;
++                }
++                d += 1;
++            }
++            d -= 1;
++            if d == length {
++                let n = result.len() - 1;
++                result[n] = SequenceDiff {
++                    seq1: OffsetRange {
++                        start: prev_result.seq1.start,
++                        end: cur.seq1.end - length,
++                    },
++                    seq2: OffsetRange {
++                        start: prev_result.seq2.start,
++                        end: cur.seq2.end - length,
++                    },
++                };
++                continue;
++            }
++            cur = delta_diff(cur, -d);
++        }
++        result.push(cur);
++    }
++    let mut result2: Vec<SequenceDiff> = Vec::new();
++    for i in 0..result.len().saturating_sub(1) {
++        let mut cur = result[i];
++        let mut next_result = result[i + 1];
++        if cur.seq1.is_empty() || cur.seq2.is_empty() {
++            let length = next_result.seq1.start - cur.seq1.end;
++            let mut d = 0i64;
++            while d < length {
++                if !seq1.is_strongly_equal(cur.seq1.start + d, cur.seq1.end + d)
++                    || !seq2.is_strongly_equal(cur.seq2.start + d, cur.seq2.end + d)
++                {
++                    break;
++                }
++                d += 1;
++            }
++            if d == length {
++                result[i + 1] = SequenceDiff {
++                    seq1: OffsetRange {
++                        start: cur.seq1.start + length,
++                        end: next_result.seq1.end,
++                    },
++                    seq2: OffsetRange {
++                        start: cur.seq2.start + length,
++                        end: next_result.seq2.end,
++                    },
++                };
++                continue;
++            }
++            if d > 0 {
++                cur = delta_diff(cur, d);
++            }
++        }
++        let _ = &mut next_result;
++        result2.push(cur);
++    }
++    if !result.is_empty() {
++        let last = result[result.len() - 1];
++        result2.push(last);
++    }
++    result2
++}
++
++fn shift_sequence_diffs(
++    seq1: &CharSeq,
++    seq2: &CharSeq,
++    mut diffs: Vec<SequenceDiff>,
++) -> Vec<SequenceDiff> {
++    for i in 0..diffs.len() {
++        let prev_diff = if i > 0 { Some(diffs[i - 1]) } else { None };
++        let diff = diffs[i];
++        let next_diff = if i + 1 < diffs.len() {
++            Some(diffs[i + 1])
++        } else {
++            None
++        };
++        let seq1_valid = OffsetRange {
++            start: prev_diff.map(|d| d.seq1.end + 1).unwrap_or(0),
++            end: next_diff.map(|d| d.seq1.start - 1).unwrap_or(seq1.length()),
++        };
++        let seq2_valid = OffsetRange {
++            start: prev_diff.map(|d| d.seq2.end + 1).unwrap_or(0),
++            end: next_diff.map(|d| d.seq2.start - 1).unwrap_or(seq2.length()),
++        };
++        if diff.seq1.is_empty() {
++            diffs[i] = shift_diff_to_better_position(diff, seq1, seq2, seq1_valid, seq2_valid);
++        } else if diff.seq2.is_empty() {
++            let swapped = SequenceDiff {
++                seq1: diff.seq2,
++                seq2: diff.seq1,
++            };
++            let shifted = shift_diff_to_better_position(swapped, seq2, seq1, seq2_valid, seq1_valid);
++            diffs[i] = SequenceDiff {
++                seq1: shifted.seq2,
++                seq2: shifted.seq1,
++            };
++        }
++    }
++    diffs
++}
++
++fn shift_diff_to_better_position(
++    diff: SequenceDiff,
++    seq1: &CharSeq,
++    _seq2_ref_unused: &CharSeq,
++    seq1_valid: OffsetRange,
++    seq2_valid: OffsetRange,
++) -> SequenceDiff {
++    // seq1 here is the *target* sequence (the one that is unchanged for this
++    // pure insertion); _seq2_ref_unused is the other. Kept for signature clarity.
++    let max_shift_limit = 100;
++    // The TS uses `seq2` for the strongly-equal walk and boundary scores on both
++    // seq1/seq2. Here the arguments already reflect that orientation.
++    let seq2 = _seq2_ref_unused;
++    let mut delta_before = 1i64;
++    while diff.seq1.start - delta_before >= seq1_valid.start
++        && diff.seq2.start - delta_before >= seq2_valid.start
++        && seq2.is_strongly_equal(diff.seq2.start - delta_before, diff.seq2.end - delta_before)
++        && delta_before < max_shift_limit
++    {
++        delta_before += 1;
++    }
++    delta_before -= 1;
++    let mut delta_after = 0i64;
++    while diff.seq1.start + delta_after < seq1_valid.end
++        && diff.seq2.end + delta_after < seq2_valid.end
++        && seq2.is_strongly_equal(diff.seq2.start + delta_after, diff.seq2.end + delta_after)
++        && delta_after < max_shift_limit
++    {
++        delta_after += 1;
++    }
++    if delta_before == 0 && delta_after == 0 {
++        return diff;
++    }
++    let mut best_delta = 0i64;
++    let mut best_score = -1i64;
++    for delta in -delta_before..=delta_after {
++        let score = seq1.boundary_score(diff.seq1.start + delta)
++            + seq2.boundary_score(diff.seq2.start + delta)
++            + seq2.boundary_score(diff.seq2.end + delta);
++        if score > best_score {
++            best_score = score;
++            best_delta = delta;
++        }
++    }
++    delta_diff(diff, best_delta)
++}
++
++/// Merge adjacent change diffs. VSCode's `removeShortMatches` merges diffs
++/// separated by an equal gap of up to 2 characters; we use gap <= 1 - enough to
++/// coalesce frequent small edits (avoiding "a diff every other character"), while
++/// keeping a genuinely separate short common run (e.g. a 2-char CJK word like
++/// 系统) from being absorbed into a surrounding substitution.
++fn remove_short_matches(diffs: &[SequenceDiff]) -> Vec<SequenceDiff> {
++    let mut result: Vec<SequenceDiff> = Vec::new();
++    for s in diffs {
++        match result.last_mut() {
++            None => result.push(*s),
++            Some(last) => {
++                if s.seq1.start - last.seq1.end <= 1 || s.seq2.start - last.seq2.end <= 1 {
++                    *last = join_diffs(*last, *s);
++                } else {
++                    result.push(*s);
++                }
++            }
++        }
++    }
++    result
++}
++
++/// extendDiffsToEntireWordIfAppropriate.
++fn extend_diffs_to_words(
++    seq1: &CharSeq,
++    seq2: &CharSeq,
++    diffs: Vec<SequenceDiff>,
++) -> Vec<SequenceDiff> {
++    let mut queue = invert_diffs(&diffs, seq1.length(), seq2.length());
++    let mut additional: Vec<SequenceDiff> = Vec::new();
++    let mut last_point: (i64, i64) = (0, 0);
++
++    while !queue.is_empty() {
++        let next = queue.remove(0);
++        if next.seq1.is_empty() {
++            continue;
++        }
++        // scanWord(start), then scanWord(end-1)
++        scan_word(
++            seq1,
++            seq2,
++            &mut queue,
++            &mut additional,
++            &mut last_point,
++            next.seq1.start,
++            next.seq2.start,
++            next,
++        );
++        let (e1, e2) = diff_ends(next);
++        scan_word(
++            seq1,
++            seq2,
++            &mut queue,
++            &mut additional,
++            &mut last_point,
++            e1 - 1,
++            e2 - 1,
++            next,
++        );
++    }
++    merge_sorted_diffs(&diffs, &additional)
++}
++
++fn scan_word(
++    seq1: &CharSeq,
++    seq2: &CharSeq,
++    queue: &mut Vec<SequenceDiff>,
++    additional: &mut Vec<SequenceDiff>,
++    last_point: &mut (i64, i64),
++    offset1: i64,
++    offset2: i64,
++    equal_mapping: SequenceDiff,
++) {
++    if offset1 < last_point.0 || offset2 < last_point.1 {
++        return;
++    }
++    let (w1, w2) = match (seq1.find_word_containing(offset1), seq2.find_word_containing(offset2)) {
++        (Some(a), Some(b)) => (a, b),
++        _ => return,
++    };
++    let mut w = SequenceDiff { seq1: w1, seq2: w2 };
++    let equal_part = intersect_diffs(w, equal_mapping);
++    let mut equal_chars1 = equal_part.map(|e| e.seq1.len()).unwrap_or(0);
++    let mut equal_chars2 = equal_part.map(|e| e.seq2.len()).unwrap_or(0);
++    while !queue.is_empty() {
++        let next = queue[0];
++        if !intersects_ranges(w.seq1, next.seq1) && !intersects_ranges(w.seq2, next.seq2) {
++            break;
++        }
++        let (v1, v2) =
++            match (seq1.find_word_containing(next.seq1.start), seq2.find_word_containing(next.seq2.start)) {
++                (Some(a), Some(b)) => (a, b),
++                _ => break,
++            };
++        let v = SequenceDiff { seq1: v1, seq2: v2 };
++        if let Some(next_equal) = intersect_diffs(v, next) {
++            equal_chars1 += next_equal.seq1.len();
++            equal_chars2 += next_equal.seq2.len();
++        }
++        w = join_diffs(w, v);
++        if w.seq1.end >= next.seq1.end {
++            queue.remove(0);
++        } else {
++            break;
++        }
++    }
++    if equal_chars1 + equal_chars2 < (w.seq1.len() + w.seq2.len()) * 2 / 3 {
++        additional.push(w);
++    }
++    *last_point = diff_ends(w);
++}
++
++fn merge_sorted_diffs(diffs1: &[SequenceDiff], diffs2: &[SequenceDiff]) -> Vec<SequenceDiff> {
++    let mut result: Vec<SequenceDiff> = Vec::new();
++    let mut one: Vec<SequenceDiff> = diffs1.to_vec();
++    let mut two: Vec<SequenceDiff> = diffs2.to_vec();
++    while !one.is_empty() || !two.is_empty() {
++        let take_one = {
++            let a = one.first();
++            let b = two.first();
++            a.is_some() && (b.is_none() || a.unwrap().seq1.start < b.unwrap().seq1.start)
++        };
++        let next = if take_one {
++            one.remove(0)
++        } else {
++            two.remove(0)
++        };
++        if let Some(last) = result.last_mut() {
++            if last.seq1.end >= next.seq1.start {
++                *last = join_diffs(*last, next);
++                continue;
++            }
++        }
++        result.push(next);
++    }
++    result
++}
++
++/// removeVeryShortMatchingTextBetweenLongDiffs: the cap-130 join rule and the
++/// short prefix/suffix extension.
++fn remove_very_short_matching_text(
++    seq1: &CharSeq,
++    seq2: &CharSeq,
++    diffs: Vec<SequenceDiff>,
++) -> Vec<SequenceDiff> {
++    if diffs.is_empty() {
++        return diffs;
++    }
++    let mut current = diffs;
++    let mut counter = 0;
++    let mut should_repeat = true;
++    while should_repeat && counter < 10 {
++        counter += 1;
++        should_repeat = false;
++        let mut result: Vec<SequenceDiff> = vec![current[0]];
++        for i in 1..current.len() {
++            let cur = current[i];
++            let last_result = result[result.len() - 1];
++            let unchanged_range = OffsetRange {
++                start: last_result.seq1.end,
++                end: cur.seq1.start,
++            };
++            let unchanged_line_count = seq1.count_lines_in(unchanged_range);
++            if unchanged_line_count > 5 || unchanged_range.len() > 500 {
++                result.push(cur);
++                continue;
++            }
++            let unchanged_text = seq1.text(unchanged_range);
++            let trimmed = unchanged_text.trim();
++            if trimmed.chars().count() > 20 || trimmed.contains('\n') {
++                result.push(cur);
++                continue;
++            }
++            let max = 2.0f64 * 40.0 + 50.0; // 130
++            let cap = |v: f64| v.min(max);
++            let power = |v: f64| v.powf(1.5);
++            // VSCode: power(cap(countLinesIn(r)*40 + rangeLen(r))) per side, summed, then power.
++            let term = |s: &CharSeq, r: OffsetRange| {
++                power(cap(s.count_lines_in(r) as f64 * 40.0 + r.len() as f64))
++            };
++            let before = power(
++                term(seq1, last_result.seq1) + term(seq2, last_result.seq2),
++            );
++            let after = power(term(seq1, cur.seq1) + term(seq2, cur.seq2));
++            if before + after > max.powf(1.5).powf(1.5) * 1.3 {
++                should_repeat = true;
++                let n = result.len() - 1;
++                result[n] = join_diffs(last_result, cur);
++            } else {
++                result.push(cur);
++            }
++        }
++        current = result;
++    }
++
++    let mut out: Vec<SequenceDiff> = Vec::new();
++    for i in 0..current.len() {
++        let mut new_diff = current[i];
++        let prev = if i > 0 { Some(current[i - 1]) } else { None };
++        let next = if i + 1 < current.len() {
++            Some(current[i + 1])
++        } else {
++            None
++        };
++        let mark_changed = |text: &str, nd: SequenceDiff| -> bool {
++            !text.is_empty()
++                && text.trim().chars().count() <= 3
++                && nd.seq1.len() + nd.seq2.len() > 100
++        };
++        let full_range1 = seq1.extend_to_full_lines(new_diff.seq1);
++        let prefix = seq1.text(OffsetRange {
++            start: full_range1.start,
++            end: new_diff.seq1.start,
++        });
++        if mark_changed(&prefix, new_diff) {
++            new_diff = delta_start_diff(new_diff, -(prefix.chars().count() as i64));
++        }
++        let suffix = seq1.text(OffsetRange {
++            start: new_diff.seq1.end,
++            end: full_range1.end,
++        });
++        if mark_changed(&suffix, new_diff) {
++            new_diff = delta_end_diff(new_diff, suffix.chars().count() as i64);
++        }
++        let available = SequenceDiff {
++            seq1: OffsetRange {
++                start: prev.map(|p| p.seq1.end).unwrap_or(0),
++                end: next.map(|n| n.seq1.start).unwrap_or(i64::MAX),
++            },
++            seq2: OffsetRange {
++                start: prev.map(|p| p.seq2.end).unwrap_or(0),
++                end: next.map(|n| n.seq2.start).unwrap_or(i64::MAX),
++            },
++        };
++        let clipped = match intersect_diffs(new_diff, available) {
++            Some(c) => c,
++            None => continue,
++        };
++        if let Some(last) = out.last_mut() {
++            if last.seq1.end == clipped.seq1.start && last.seq2.end == clipped.seq2.start {
++                *last = join_diffs(*last, clipped);
++                continue;
++            }
++        }
++        out.push(clipped);
++    }
++    out
++}
++
++// ───────────────────────────────── block entry ─────────────────────────────────
++
++/// Mark one deletion run against one addition run — one change block in VSCode
++/// terms: a single character diff over both trimmed-line sequences, the heuristic
++/// chain, then ranges mapped back to per-line spans.
++pub fn block_diff_runs<'a>(
++    del_run: &[&'a str],
++    add_run: &[&'a str],
++) -> (Vec<Vec<DiffSpan<'a>>>, Vec<Vec<DiffSpan<'a>>>) {
++    let whole_del: Vec<Vec<DiffSpan>> = del_run
++        .iter()
++        .map(|t| whole_line(t, Mark::Del))
++        .collect();
++    let whole_ins: Vec<Vec<DiffSpan>> = add_run
++        .iter()
++        .map(|t| whole_line(t, Mark::Ins))
++        .collect();
++    if del_run.is_empty() || add_run.is_empty() {
++        return (whole_del, whole_ins);
++    }
++    let seq1 = CharSeq::new(del_run);
++    let seq2 = CharSeq::new(add_run);
++    if seq1.length() * seq2.length() > BLOCK_PRODUCT_LIMIT {
++        return (whole_del, whole_ins);
++    }
++    let mut diffs = if seq1.length() + seq2.length() < DP_LENGTH_LIMIT {
++        dp_diff(&seq1, &seq2)
++    } else {
++        myers_diff(&seq1, &seq2)
++    };
++    diffs = optimize_sequence_diffs(&seq1, &seq2, diffs);
++    diffs = extend_diffs_to_words(&seq1, &seq2, diffs);
++    diffs = remove_short_matches(&diffs);
++    diffs = remove_very_short_matching_text(&seq1, &seq2, diffs);
++    // A line is a "whitespace pair" if it maps 1:1 to a counterpart with equal
++    // trimmed content (a pure indentation change) — its whitespace marks are kept.
++    let ws = |lines: &[&str], other: &[&str]| -> Vec<bool> {
++        (0..lines.len())
++            .map(|i| other.get(i).is_some_and(|o| lines[i].trim() == o.trim()))
++            .collect()
++    };
++    let del_ws = ws(del_run, add_run);
++    let add_ws = ws(add_run, del_run);
++    (
++        diffs_to_line_spans(del_run, &seq1, &seq2, &diffs, true, &del_ws),
++        diffs_to_line_spans(add_run, &seq2, &seq1, &diffs, false, &add_ws),
++    )
++}
++
++/// A whole-line span pair for an unpaired deletion or addition.
++fn whole_line<'a>(text: &'a str, mark: Mark) -> Vec<DiffSpan<'a>> {
++    if text.is_empty() {
++        Vec::new()
++    } else {
++        vec![DiffSpan {
++            text,
++            mark: Some(mark),
++            spans_line: false,
++        }]
++    }
++}
++
++/// Cut each raw line at its side's marked ranges. A change whose side is empty
++/// renders as a zero-width bar (VSCode's empty-change marker); a whitespace-only
++/// change containing a line separator renders a placeholder at that line's end
++/// (a split/join boundary).
++fn diffs_to_line_spans<'a>(
++    lines: &[&'a str],
++    seq: &CharSeq,
++    other_seq: &CharSeq,
++    diffs: &[SequenceDiff],
++    left: bool,
++    ws_pair: &[bool],
++) -> Vec<Vec<DiffSpan<'a>>> {
++    let line_char_counts: Vec<usize> = lines.iter().map(|l| l.chars().count()).collect();
++    let mut marks: Vec<Vec<bool>> = lines
++        .iter()
++        .map(|l| vec![false; l.chars().count()])
++        .collect();
++    // (char position within line, drop): `drop` is true for a bar whose counterpart
++    // is a whole line that carries content (it gets its own row); intra-line bars and
++    // pure-newline boundary bars have drop=false and render as placeholders.
++    let mut bars: Vec<Vec<(usize, bool)>> = vec![Vec::new(); lines.len()];
++    let len = seq.length();
++    for diff in diffs {
++        let range = if left { diff.seq1 } else { diff.seq2 };
++        let other = if left { diff.seq2 } else { diff.seq1 };
++        let other_has_nl = (other.start.max(0)..other.end).any(|k| other_seq.element(k) == '\n');
++        let other_has_content =
++            (other.start.max(0)..other.end).any(|k| !other_seq.element(k).is_whitespace());
++        if range.is_empty() && !other.is_empty() {
++            let drop = other_has_nl && other_has_content;
++            let p = range.start.clamp(0, len);
++            let line = seq.line_of(p.min(len.max(1) - 1));
++            if let Some(&count) = line_char_counts.get(line) {
++                let raw_at = (p - seq.line_start[line] as i64 + seq.trimmed_ws[line] as i64)
++                    .clamp(0, count as i64) as usize;
++                bars[line].push((raw_at, drop));
++            }
++            continue;
++        }
++        let start = range.start.max(0);
++        let end = range.end.min(len);
++        let mut at = start;
++        while at < end {
++            let line = seq.line_of(at);
++            if at as usize == seq.line_trimmed_end[line] {
++                // the `\n` separator element marks no character
++                at += 1;
++                continue;
++            }
++            let raw_at = at - seq.line_start[line] as i64 + seq.trimmed_ws[line] as i64;
++            let count = line_char_counts[line];
++            let ch = seq.element(at);
++            // Keep a whitespace mark when it is a pure-indentation pair line, a
++            // newline boundary (other side has a '\n'), or a pure insertion/deletion
++            // (other side empty -> the whitespace is real added/removed content).
++            // Otherwise (space<->space reflow) it is noise and is dropped.
++            let keep = if ch.is_whitespace() {
++                ws_pair.get(line).copied().unwrap_or(false) || other_has_nl || other.is_empty()
++            } else {
++                true
++            };
++            if keep && raw_at >= 0 && (raw_at as usize) < count {
++                marks[line][raw_at as usize] = true;
++            }
++            at += 1;
++        }
++    }
++    let mark_kind = if left { Mark::Del } else { Mark::Ins };
++    // A bar marks the OTHER side's change, so it uses the opposite emphasis:
++    // a bar on the minus side means the plus side inserted content there -> green;
++    // a bar on the plus side means the minus side deleted content there -> red.
++    let bar_kind = if left { Mark::Ins } else { Mark::Del };
++    lines
++        .iter()
++        .enumerate()
++        .map(|(line_idx, &line)| {
++            let mask = &marks[line_idx];
++            let mut line_bars = bars[line_idx].clone();
++            line_bars.sort_unstable();
++            let bytes = &seq.char_bytes[line_idx];
++            let n = bytes.len() - 1; // char count of `line`
++            let push_run =
++                |spans: &mut Vec<DiffSpan<'a>>, a: usize, b: usize, marked: bool| {
++                    if b > a {
++                        let text = CharSeq::slice(line, bytes, a, b);
++                        spans.push(DiffSpan {
++                            text,
++                            mark: if marked { Some(mark_kind) } else { None },
++                            spans_line: false,
++                        });
++                    }
++                };
++            let mut spans: Vec<DiffSpan<'a>> = Vec::new();
++            let mut run_start = 0usize;
++            let mut run_marked = mask.first().copied().unwrap_or(false);
++            let mut bi = 0usize;
++            let mut i = 0usize;
++            while i <= n {
++                while bi < line_bars.len() && line_bars[bi].0 == i {
++                    push_run(&mut spans, run_start, i, run_marked);
++                    run_start = i;
++                    spans.push(DiffSpan {
++                        text: "",
++                        mark: Some(bar_kind),
++                        spans_line: line_bars[bi].1,
++                    });
++                    bi += 1;
++                }
++                if i == n {
++                    break;
++                }
++                let is_marked = mask[i];
++                if is_marked != run_marked {
++                    push_run(&mut spans, run_start, i, run_marked);
++                    run_start = i;
++                    run_marked = is_marked;
++                }
++                i += 1;
++            }
++            push_run(&mut spans, run_start, n, run_marked);
++            spans
++        })
++        .collect()
++}
++
++// ───────────────────────────────── widening ─────────────────────────────────
++
++/// A line widened with one-cell placeholders for intra-line empty-change bars.
++/// `ranges` maps each rendered piece to `(is_emphasis, byte_start, byte_end)`
++/// in `text`; the caller maps `is_emphasis` to the emph/base style and slices
++/// `text`. Intra-line bars become a single placeholder space; whole-line
++/// counterpart bars are dropped (their line already has its own row).
++pub struct WidenedLine {
++    pub text: String,
++    pub ranges: Vec<(Option<Mark>, usize, usize)>,
++}
++
++/// Render one line's spans into a widened line + ranges (see [`WidenedLine`]).
++///
++/// A zero-width bar is rendered as a one-cell placeholder only when it is an
++/// intra-line change (`spans_line == false`); whole-line counterpart bars are
++/// dropped because that line already has its own row in side-by-side.
++pub fn widen_line(spans: &[DiffSpan]) -> WidenedLine {
++    let mut text = String::new();
++    let mut ranges: Vec<(Option<Mark>, usize, usize)> = Vec::new();
++    for s in spans {
++        if s.text.is_empty() {
++            if let Some(m) = s.mark {
++                if !s.spans_line {
++                    let start = text.len();
++                    // Braille blank: renders as an empty cell but is NOT Unicode
++                    // whitespace, so delta's trailing-whitespace-error styling does
++                    // not hijack a placeholder that sits at a line's end.
++                    text.push('\u{2800}');
++                    ranges.push((Some(m), start, text.len()));
++                }
++            }
++            continue;
++        }
++        let start = text.len();
++        text.push_str(s.text);
++        ranges.push((s.mark, start, text.len()));
++    }
++    WidenedLine { text, ranges }
++}
++
++// ───────────────────────────────── tests ─────────────────────────────────
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Concatenate spans: `#` fences a changed range, `│` is the cursor-wide bar.
++    fn render(spans: &[DiffSpan]) -> String {
++        spans
++            .iter()
++            .map(|s| match s.mark {
++                None => s.text.to_string(),
++                Some(_) if s.text.is_empty() => "\u{2502}".to_string(),
++                Some(_) => format!("#{}#", s.text),
++            })
++            .collect()
++    }
++
++    #[test]
++    fn marks_only_the_changed_chars() {
++        let (del, ins) = block_diff_runs(&["hello world"], &["hello brave world"]);
++        assert_eq!(render(&del[0]), "hello\u{2502} world");
++        assert_eq!(render(&ins[0]), "hello# brave# world");
++    }
++
++    #[test]
++    fn aligns_a_moved_line_as_common() {
++        let (del, ins) = block_diff_runs(&["keep", "gone"], &["fresh", "keep"]);
++        assert_eq!(render(&del[0]), "\u{2502}keep");
++        assert_eq!(render(&ins[0]), "#fresh#");
++        assert_eq!(render(&ins[1]), "keep\u{2502}");
++    }
++
++    #[test]
++    fn collapses_a_wholly_rewritten_pair() {
++        let (_del, ins) = block_diff_runs(&["gone one", "gone two"], &["kept"]);
++        assert_eq!(render(&ins[0]), "#kept#");
++    }
++
++    #[test]
++    fn pairs_rewritten_line_with_true_counterpart() {
++        let (del, ins) = block_diff_runs(
++            &["import { StyleSheet, TouchableOpacity } from"],
++            &["import { WenShu } from", "import { StyleSheet } from"],
++        );
++        assert_eq!(
++            render(&del[0]),
++            "\u{2502}import { StyleSheet#, TouchableOpacity# } from"
++        );
++        assert_eq!(render(&ins[0]), "#import { WenShu } from#");
++        assert_eq!(render(&ins[1]), "import { StyleSheet\u{2502} } from");
++    }
++
++    #[test]
++    fn degrades_past_block_cap() {
++        let del: Vec<String> = (0..60).map(|i| format!("line {} {}", i, "x".repeat(700))).collect();
++        let add: Vec<String> = (0..60).map(|i| format!("line {} {}", i, "y".repeat(700))).collect();
++        let del_refs: Vec<&str> = del.iter().map(|s| s.as_str()).collect();
++        let add_refs: Vec<&str> = add.iter().map(|s| s.as_str()).collect();
++        let (del_spans, ins_spans) = block_diff_runs(&del_refs, &add_refs);
++        assert_eq!(del_spans.len(), 60);
++        assert_eq!(ins_spans.len(), 60);
++        assert!(render(&ins_spans[0]).contains('#'));
++    }
++}
+diff --git a/src/subcommands/show_config.rs b/src/subcommands/show_config.rs
+index 4725aa7bf..c05c776b2 100644
+--- a/src/subcommands/show_config.rs
++++ b/src/subcommands/show_config.rs
+@@ -129,7 +129,8 @@ pub fn show_config(config: &config::Config, writer: &mut dyn Write) -> std::io::
+     syntax-theme                  = {syntax_theme}
+     width                         = {width}
+     tabs                          = {tab_width}
+-    word-diff-regex               = {tokenization_regex}",
++    word-diff-regex               = {tokenization_regex}
++    word-diff-engine              = {word_diff_engine}",
+         diff_stat_align_width = config.diff_stat_align_width,
+         max_line_distance = config.max_line_distance,
+         max_line_length = config.max_line_length,
+@@ -161,6 +162,10 @@ pub fn show_config(config: &config::Config, writer: &mut dyn Write) -> std::io::
+         },
+         tab_width = config.tab_cfg.width(),
+         tokenization_regex = format_option_value(config.tokenization_regex.to_string()),
++        word_diff_engine = match config.word_diff_engine {
++            cli::WordDiffEngine::Delta => "delta",
++            cli::WordDiffEngine::Refined => "refined",
++        },
+     )?;
+     Ok(())
+ }
